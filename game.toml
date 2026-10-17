@@ -1,0 +1,96 @@
+# Autofilled by tools/new_project_layout/probe_disc.py from your legal dump.
+# Review before shipping. Runtime quirks / overlay seeds still need hand work.
+
+[game]
+name = "MsPacManMazeMadness"
+id = "SLUS-01018"
+players = 2
+exe = "disc/SLUS_010.18"
+# Put your dump (cue + 7 bins) in disc/. Relative paths resolve from the
+# game folder upward, so build-release/ finds it here.
+disc = "disc/Ms. Pac-Man - Maze Madness.cue"
+load_address = "0x801FBE08"
+entry_pc = "0x801FBF1C"
+text_size = "0x00003000"
+stack_base = "0x801FFFF0"
+
+# Digests are for data Track 01 (first BINARY FILE / TRACK 01).
+[prepare_disc]
+out_dir = "disc"
+bin_name = "Ms. Pac-Man - Maze Madness (Track 1).bin"
+cue_name = "Ms. Pac-Man - Maze Madness.cue"
+boot_exe = "SLUS_010.18"
+known_sizes = [298348848]
+known_md5 = [
+  "8465d1516bc6e0e7ade19a30acecc60a",
+]
+known_sha1 = [
+  "cdf130d0807f498b1705e423bea3104993263b62",
+]
+known_crc32 = [
+  "2f4d4c80",
+]
+
+[recompiler]
+seeds = "seeds/ghidra_funcs.txt"
+# Instruction hooks for the widescreen mod's squash-billboards feature
+# (mods/src/mpmm_widescreen.c): the billboard corner math in MAIN.EXE.
+mod_instruction_sites = ["0x80049F3C", "0x80088BD4", "0x8008A534"]
+out_dir = "generated"
+strict = true
+
+[runtime]
+window_title = "MsPacManMazeMadness Recompiled"
+memcard_dir = "saves"
+overlay_cache = true
+
+[video]
+renderer = "opengl"
+# Leave at 4:3: on PSX the widescreen mod (mods/preloaded/packages/
+# mpmm.enhancement.widescreen) selects 16:9 when it is enabled.
+aspect_ratio = "4:3"
+# Smooth motion: when the game draws fewer than 60 frames per second, the
+# render thread draws in-between frames from recorded data (no game code runs
+# again). Set both to false for the original frame pacing.
+render_thread = true
+frame_generation = true
+
+[widescreen]
+# Keep the HUD at its original proportions when the widescreen mod is on.
+auto_ui_squash = true
+# 3D-game detector: a frame that projects 3D geometry counts as gameplay and
+# is shown wide; FMV and flat 2D screens (classic mode) stay 4:3. Without it
+# every frame would be treated as a menu.
+gte_game_mode = true
+# true = native-wide: nothing is stretched, but the game's own edge culls must
+# be widened (the [widescreen.cull] sites below); a few small edge glitches
+# remain. false = squash (classic GTE widescreen hack): clean level edges; the
+# widescreen mod's squash-billboards feature keeps Ms. Pac-Man's body round
+# (disable that feature if you set true). The 2D logo looks slightly stretched.
+native_wide = false
+
+# Widescreen culls (identity at 4:3; compiled into the native code, so
+# regenerate after changing them). The 3D renderers drop a polygon whose
+# corners are all left of the screen (packed SXY << 16, then BLTZ); while the
+# view is widened those branches are not taken, so the revealed left strip is
+# drawn. 0x8009B9C0.. is a textbook 513/241 quad cull; its right-edge SLTIs
+# move out by the live margin.
+[widescreen.cull]
+branch_keep_sites = [
+  "0x80081EB4", "0x800820BC", "0x8008233C", "0x80083654", "0x800839B4",
+  "0x80083E1C", "0x800840FC", "0x80087BA4", "0x80087E1C", "0x8009B9F0",
+]
+slti_sites = ["0x8009BA40", "0x8009BA54", "0x8009BA68", "0x8009BA7C"]
+
+[controller]
+default_mode = "digital"
+# Player 1 uses the first connected gamepad (the Steam Deck controls are
+# one). Set "keyboard" to play with the keyboard instead.
+p1_device = "auto"
+
+# Online mount gate: digests + track count + optional TOC fingerprint
+# (see docs/NETPLAY.md).
+[netplay]
+require_cue = true
+required_tracks = 7
+required_disc_fp = "4f492f3030e9999ecbd5edf7d47d8d8480fac4aed4680c0e2fc88f04004556d5"

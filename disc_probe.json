@@ -1,0 +1,29 @@
+{
+  "cue_path": "disc/Ms. Pac-Man - Maze Madness.cue",
+  "cue_name": "Ms. Pac-Man - Maze Madness.cue",
+  "bin_name": "Ms. Pac-Man - Maze Madness (Track 1).bin",
+  "track_count": 7,
+  "data_track_size": 298348848,
+  "data_track_md5": "8465d1516bc6e0e7ade19a30acecc60a",
+  "data_track_sha1": "cdf130d0807f498b1705e423bea3104993263b62",
+  "data_track_crc32": "2f4d4c80",
+  "boot_exe": "SLUS_010.18",
+  "serial": "SLUS-01018",
+  "serial_exe": "SLUS_010.18",
+  "volume_id": "MS PACMAN",
+  "display_name": "MsPacManMazeMadness",
+  "load_address": "0x801FBE08",
+  "entry_pc": "0x801FBF1C",
+  "text_size": "0x00003000",
+  "stack_base": "0x801FFFF0",
+  "require_cue": true,
+  "required_disc_fp": "4f492f3030e9999ecbd5edf7d47d8d8480fac4aed4680c0e2fc88f04004556d5",
+  "boot_exe_sha256": "2ea9dafaa39a28d88ca283a683682908732f9259240283b00e6f52077356f964",
+  "seed_count": 34,
+  "warnings": [],
+  "notes": [
+    "entry_pc/load_address/text_size/stack_base taken from PS-X EXE header.",
+    "seeds are first-pass boot-EXE JAL targets (+ entry); expect to grow as overlays / runtime paths are discovered.",
+    "required_disc_fp is psxrecomp-toc-v1 (matches runtime DiscIdentity)."
+  ]
+}

@@ -1,0 +1,33 @@
+format_version = 5
+id = "mpmm.enhancement.widescreen"
+version = "1.0.0"
+name = "Widescreen 16:9"
+author = "MsPacManMazeMadnessRecomp"
+description = "Shows the 3D game in 16:9 instead of 4:3. Presentation-only: game logic is unchanged. FMV and 2D-only screens stay 4:3."
+resolver = "declarative"
+save_compatibility = "shared"
+
+[[target]]
+game_id = "SLUS-01018"
+
+[[feature]]
+id = "widescreen"
+name = "Widescreen 16:9"
+description = "Enabled by default. Widens the 3D view to 16:9 and keeps the HUD at its original proportions. Objects at the far left and right edges may appear late, because the game only plans for a 4:3 view. Disable it for the original 4:3 picture."
+group = "Visual"
+default_enabled = true
+
+[[plugin]]
+feature = "widescreen"
+id = "mpmm.widescreen"
+
+[[feature]]
+id = "squash-billboards"
+name = "Round billboards (squash mode)"
+description = "Enabled by default, for the default squash widescreen (game.toml [widescreen] native_wide = false). Keeps billboard objects such as Ms. Pac-Man's body round instead of stretched. Disable it if you switch to native_wide = true, where it would make them too narrow."
+group = "Visual"
+default_enabled = true
+
+[[plugin]]
+feature = "squash-billboards"
+id = "mpmm.squash-billboards"
