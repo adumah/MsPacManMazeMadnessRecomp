@@ -33,9 +33,6 @@
 #include <GL/glcorearb.h>
 
 static int s_nxlink_sock = -1;
-static pthread_t s_heartbeat;
-static int s_heartbeat_running;
-static volatile int s_heartbeat_stop;
 
 void userAppInit(void)
 {
@@ -44,13 +41,14 @@ void userAppInit(void)
 }
 
 /* Runs on every way out (exit, return from main, abort) before hbloader
- * unmaps the program: stop our thread first, or it wakes up in unmapped code. */
+ * unmaps the program: stop our threads first, or they wake up in unmapped code. */
+static void prof_stop(void);
+static void boost_stop(void);
+
 void userAppExit(void)
 {
-    if (s_heartbeat_running) {
-        s_heartbeat_stop = 1;
-        pthread_join(s_heartbeat, NULL);
-    }
+    prof_stop();
+    boost_stop();
     if (s_nxlink_sock >= 0)
         close(s_nxlink_sock);
     socketExit();
@@ -75,39 +73,99 @@ void __wrap_abort(void)
     __real_abort();
 }
 
-/* Startup heartbeat: every 3 s for the first 2 minutes, log the newest
- * completed launch phase (host_launch_timing.h), so a black screen on the
- * console tells us whether startup is busy, stuck in one phase, or dead. */
-#include "host_launch_timing.h"
+/* CPU boost: the emulation needs 1785 MHz (the CPU clock of the system's own
+ * boost mode) to hold full speed; stock is 1020. Raise it at launch so no
+ * overclocking tool is needed, and put the original rate back on exit.
+ * Docking, undocking and returning from the Home Menu reapply the stock
+ * clocks, so a thread raises it again when it finds it lower. A clock set
+ * higher by a tool such as sys-clk is left alone. MPMM_CPU_BOOST=0 turns it
+ * off; MPMM_CPU_BOOST=<MHz> picks another rate. */
+static pthread_t s_boost;
+static int s_boost_running;
+static volatile int s_boost_stop;
+static u32 s_boost_hz;
+static u32 s_boost_orig_hz;
+static int s_boost_clkrst;
+static ClkrstSession s_boost_session;
 
-static void *startup_heartbeat(void *arg)
+static Result boost_get(u32 *hz)
+{
+    return s_boost_clkrst ? clkrstGetClockRate(&s_boost_session, hz)
+                          : pcvGetClockRate(PcvModule_CpuBus, hz);
+}
+
+static Result boost_set(u32 hz)
+{
+    return s_boost_clkrst ? clkrstSetClockRate(&s_boost_session, hz)
+                          : pcvSetClockRate(PcvModule_CpuBus, hz);
+}
+
+static void *boost_thread_main(void *arg)
 {
     (void)arg;
-    uint64_t last_total = 0;
-    for (int tick = 1; tick <= 40; ++tick) {
-        for (int i = 0; i < 30; ++i) {
-            if (s_heartbeat_stop)
-                return NULL;
+    while (!s_boost_stop) {
+        u32 hz = 0;
+        if (R_SUCCEEDED(boost_get(&hz)) && hz < s_boost_hz)
+            boost_set(s_boost_hz);
+        for (int i = 0; i < 10 && !s_boost_stop; ++i)
             svcSleepThread(100000000ull);
-        }
-        uint64_t total = 0;
-        HostLaunchTimingEvent ev;
-        uint32_t n = host_launch_timing_snapshot(&ev, 1, &total, NULL);
-        if (n && total != last_total)
-            fprintf(stderr, "[switch] t=%ds: %llu launch phases done, last %s%s%s (%llu ms, %s)\n",
-                    tick * 3, (unsigned long long)total,
-                    host_launch_timing_stage_name(ev.stage),
-                    ev.package_id[0] ? " " : "", ev.package_id,
-                    (unsigned long long)(ev.duration_us / 1000), ev.ok ? "ok" : "failed");
-        else
-            fprintf(stderr, "[switch] t=%ds: alive, %llu launch phases done\n",
-                    tick * 3, (unsigned long long)total);
-        last_total = total;
     }
     return NULL;
 }
 
+static void boost_start(void)
+{
+    const char *e = getenv("MPMM_CPU_BOOST");
+    long mhz = e ? strtol(e, NULL, 10) : 1785;
+    if (mhz <= 0)
+        return;
+    s_boost_hz = (u32)mhz * 1000000u;
+
+    if (hosversionAtLeast(8, 0, 0)) {
+        if (R_FAILED(clkrstInitialize()))
+            return;
+        if (R_FAILED(clkrstOpenSession(&s_boost_session, PcvModuleId_CpuBus, 3))) {
+            clkrstExit();
+            return;
+        }
+        s_boost_clkrst = 1;
+    } else if (R_FAILED(pcvInitialize())) {
+        return;
+    }
+    boost_get(&s_boost_orig_hz);
+    Result rc = boost_set(s_boost_hz);
+    u32 now = 0;
+    boost_get(&now);
+    fprintf(stderr, "[switch] CPU boost %u -> %u MHz (%s)\n", s_boost_orig_hz / 1000000u,
+            now / 1000000u, R_SUCCEEDED(rc) ? "ok" : "failed");
+    if (pthread_create(&s_boost, NULL, boost_thread_main, NULL) == 0)
+        s_boost_running = 1;
+}
+
+static void boost_stop(void)
+{
+    if (!s_boost_hz)
+        return;
+    if (s_boost_running) {
+        s_boost_stop = 1;
+        pthread_join(s_boost, NULL);
+        s_boost_running = 0;
+    }
+    if (s_boost_orig_hz)
+        boost_set(s_boost_orig_hz);
+    if (s_boost_clkrst) {
+        clkrstCloseSession(&s_boost_session);
+        clkrstExit();
+        s_boost_clkrst = 0;
+    } else {
+        pcvExit();
+    }
+    s_boost_hz = 0;
+}
+
 int __real_main(int argc, char **argv);
+int __wrap_main(int argc, char **argv);
+static void prof_start(void);
 
 int __wrap_main(int argc, char **argv)
 {
@@ -151,6 +209,45 @@ int __wrap_main(int argc, char **argv)
      * memory to load compiled overlay caches into anyway. */
     setenv("PSX_OVERLAY_AUTOCOMPILE_OFF", "1", 1);
 
+    /* Emulation owns core 0 (see __wrap_pthread_create). */
+    svcSetThreadCoreMask(CUR_THREAD_HANDLE, 0, 0x1);
+
+    /* Started from the Homebrew Menu there is no terminal: keep the log in
+     * log.txt beside the .nro, and the previous run's as log-previous.txt. */
+    if (s_nxlink_sock < 0) {
+        char log_path[PATH_MAX], prev_path[PATH_MAX];
+        snprintf(log_path, sizeof(log_path), "%s/log.txt", dir);
+        snprintf(prev_path, sizeof(prev_path), "%s/log-previous.txt", dir);
+        rename(log_path, prev_path);
+        if (freopen(log_path, "w", stdout))
+            setvbuf(stdout, NULL, _IOLBF, 0);
+        if (freopen(log_path, "a", stderr))
+            setvbuf(stderr, NULL, _IOLBF, 0);
+    }
+
+    /* environment.txt beside the .nro: NAME=value per line ('#' comments),
+     * the runtime's settings without a PC. nxlink arguments override it. */
+    char env_path[PATH_MAX];
+    snprintf(env_path, sizeof(env_path), "%s/environment.txt", dir);
+    FILE *envf = fopen(env_path, "r");
+    if (envf) {
+        char line[512];
+        while (fgets(line, sizeof(line), envf)) {
+            char *p = line;
+            while (*p == ' ' || *p == '\t') ++p;
+            if (*p == '#' || *p == '\0' || *p == '\n' || *p == '\r')
+                continue;
+            p[strcspn(p, "\r\n")] = '\0';
+            char *eq = strchr(p, '=');
+            if (!eq || eq == p)
+                continue;
+            *eq = '\0';
+            setenv(p, eq + 1, 1);
+            fprintf(stderr, "[switch] environment.txt %s=%s\n", p, eq + 1);
+        }
+        fclose(envf);
+    }
+
     /* There's no shell to set the runtime's diagnostic variables from:
      * NAME=value arguments (nxlink nro NAME=value ...) go to the environment
      * instead of the runtime. Then boot straight into the game, as
@@ -177,9 +274,19 @@ int __wrap_main(int argc, char **argv)
         argv = args;
     }
 
+    /* Switch performance defaults (an nxlink NAME=value argument overrides):
+     * batch DMA word events, present without blocking on vsync (the runtime's
+     * wall-clock pacer keeps the speed), no Smooth motion redraws, and no
+     * per-audio-sample scheduler deadline. Measured on hardware at 1785 MHz
+     * (16:9): FMV 25 -> 43 Hz, gameplay 40 -> 47 Hz. */
+    setenv("PSX_DMA_EVENT_WINDOW", "256", 0);
+    setenv("PSX_VSYNC", "0", 0);
+    setenv("PSX_FRAME_GEN", "0", 0);
+    setenv("PSX_SPU_SAMPLE_EVENTS", "0", 0);
+
     fprintf(stderr, "[switch] exe %s\n", exe_path);
-    if (pthread_create(&s_heartbeat, NULL, startup_heartbeat, NULL) == 0)
-        s_heartbeat_running = 1;
+    boost_start();
+    prof_start();
     return __real_main(argc, argv);
 }
 
@@ -246,8 +353,10 @@ int timespec_get(struct timespec *ts, int base)
  * creating thread's core, and Horizon doesn't time-slice threads of equal
  * priority on one core. A busy or spin-waiting main thread then starves the
  * runtime's other threads (overlay init, render, CD, audio) and startup hangs.
- * Let each new thread run on any of the application's cores 0-2, starting on
- * 1, 2, 0, ... in turn; the main thread keeps core 0.
+ * The main thread runs the whole emulation (CPU, devices, GPU command
+ * processing) and is the bottleneck, so it gets core 0 to itself; every other
+ * thread may run on cores 1-2, starting on 1, 2, 1, ... in turn. The render
+ * thread spin-waits before it sleeps, and on core 0 that took emulation time.
  * libnx also gives threads a 128 KiB stack where glibc gives 8 MiB, and the
  * runtime's threads overflowed it (classic mode crashed with SP below the
  * stack region), so threads without their own stack get 8 MiB. */
@@ -259,11 +368,14 @@ typedef struct {
     int core;
 } thread_trampoline;
 
+static void prof_register_thread(Handle h, void *start);
+
 static void *thread_on_core(void *p)
 {
     thread_trampoline t = *(thread_trampoline *)p;
     free(p);
-    svcSetThreadCoreMask(CUR_THREAD_HANDLE, t.core, 0x7);
+    svcSetThreadCoreMask(CUR_THREAD_HANDLE, t.core, 0x6);
+    prof_register_thread(threadGetCurHandle(), (void *)t.start);
     return t.start(t.arg);
 }
 
@@ -273,13 +385,13 @@ int __real_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
 int __wrap_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
                           void *(*start)(void *), void *arg)
 {
-    static int next_core = 1;
+    static int next_core = 0;
     thread_trampoline *t = malloc(sizeof(*t));
     if (!t)
         return __real_pthread_create(thread, attr, start, arg);
     t->start = start;
     t->arg = arg;
-    t->core = __atomic_fetch_add(&next_core, 1, __ATOMIC_RELAXED) % 3;
+    t->core = 1 + __atomic_fetch_add(&next_core, 1, __ATOMIC_RELAXED) % 2;
     pthread_attr_t big;
     if (attr)
         big = *attr;
@@ -319,3 +431,208 @@ int __wrap_rename(const char *from, const char *to)
     errno = saved;
     return -1;
 }
+
+/* Sampling profiler (SWITCH_PROF=1): a high-priority thread pauses every
+ * runtime thread about once a millisecond, reads its PC and LR, and resumes
+ * it. Every 5 s it writes the window's histogram to
+ * /switch/mspacman/prof/wNNN.txt as ELF offsets ("T idx start", then
+ * "P idx pc n", "L idx lr n" and "S idx n pc lr ret..." call stacks);
+ * symbolize on the PC with an nm table. */
+#define PROF_MAX_THREADS 32
+#define PROF_SLOTS (1u << 17)
+
+typedef struct {
+    uint64_t key;
+    uint32_t count;
+} prof_slot;
+
+#define PROF_STACK_DEPTH 8
+#define PROF_STACK_SLOTS (1u << 14)
+
+typedef struct {
+    uint64_t hash;
+    uint32_t count;
+    uint32_t thread;
+    uint64_t frames[PROF_STACK_DEPTH];
+} prof_stack;
+
+static prof_stack *s_prof_stacks;
+static Handle s_prof_handles[PROF_MAX_THREADS];
+static uintptr_t s_prof_starts[PROF_MAX_THREADS];
+static int s_prof_nthreads;
+static int s_prof_on = -1;
+static prof_slot *s_prof_hist;
+static Thread s_prof_thread;
+static volatile int s_prof_stop;
+
+static int prof_enabled(void)
+{
+    if (s_prof_on < 0) {
+        const char *e = getenv("SWITCH_PROF");
+        s_prof_on = e && e[0] == '1';
+    }
+    return s_prof_on;
+}
+
+static void prof_register_thread(Handle h, void *start)
+{
+    if (!prof_enabled())
+        return;
+    int i = __atomic_fetch_add(&s_prof_nthreads, 1, __ATOMIC_RELAXED);
+    if (i >= PROF_MAX_THREADS)
+        return;
+    s_prof_starts[i] = (uintptr_t)start;
+    __atomic_store_n(&s_prof_handles[i], h, __ATOMIC_RELEASE);
+}
+
+static void prof_count(uint64_t key)
+{
+    uint32_t i = (uint32_t)((key * 0x9E3779B97F4A7C15ull) >> 47) & (PROF_SLOTS - 1);
+    for (uint32_t n = 0; n < PROF_SLOTS; ++n, i = (i + 1) & (PROF_SLOTS - 1)) {
+        if (s_prof_hist[i].key == key) {
+            s_prof_hist[i].count++;
+            return;
+        }
+        if (s_prof_hist[i].count == 0) {
+            s_prof_hist[i].key = key;
+            s_prof_hist[i].count = 1;
+            return;
+        }
+    }
+}
+
+/* Walk the paused thread's x29 chain (the runtime keeps frame pointers),
+ * staying inside the mapping that holds its SP so a stray FP can't fault. */
+static void prof_count_stack(int thread, const ThreadContext *ctx, uintptr_t base)
+{
+    MemoryInfo mi;
+    u32 page;
+    if (R_FAILED(svcQueryMemory(&mi, &page, ctx->sp)))
+        return;
+    uint64_t lo = ctx->sp, hi = mi.addr + mi.size;
+    uint64_t frames[PROF_STACK_DEPTH] = { ctx->pc.x - base, ctx->lr - base };
+    int n = 2;
+    uint64_t fp = ctx->fp;
+    while (n < PROF_STACK_DEPTH && fp >= lo && fp + 16 <= hi && (fp & 7) == 0) {
+        const uint64_t *rec = (const uint64_t *)fp;
+        frames[n++] = rec[1] - base;
+        if (rec[0] <= fp)
+            break;
+        fp = rec[0];
+    }
+    uint64_t h = 0xcbf29ce484222325ull ^ (uint64_t)thread;
+    for (int i = 0; i < n; ++i)
+        h = (h ^ frames[i]) * 0x100000001b3ull;
+    h |= 1;
+    uint32_t i = (uint32_t)(h >> 50) & (PROF_STACK_SLOTS - 1);
+    for (uint32_t k = 0; k < PROF_STACK_SLOTS; ++k, i = (i + 1) & (PROF_STACK_SLOTS - 1)) {
+        prof_stack *e = &s_prof_stacks[i];
+        if (e->hash == h) {
+            e->count++;
+            return;
+        }
+        if (e->hash == 0) {
+            e->hash = h;
+            e->count = 1;
+            e->thread = (uint32_t)thread;
+            memcpy(e->frames, frames, sizeof(frames));
+            return;
+        }
+    }
+}
+
+static void prof_dump(int window, uint64_t samples)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/switch/mspacman/prof/w%03d.txt", window);
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return;
+    uintptr_t base = (uintptr_t)__code_start;
+    fprintf(f, "window %d samples %llu\n", window, (unsigned long long)samples);
+    int nt = s_prof_nthreads < PROF_MAX_THREADS ? s_prof_nthreads : PROF_MAX_THREADS;
+    for (int t = 0; t < nt; ++t)
+        fprintf(f, "T %d 0x%lx\n", t,
+                s_prof_starts[t] ? (unsigned long)(s_prof_starts[t] - base) : 0ul);
+    for (uint32_t i = 0; i < PROF_SLOTS; ++i) {
+        if (!s_prof_hist[i].count)
+            continue;
+        uint64_t k = s_prof_hist[i].key;
+        fprintf(f, "%c %u 0x%lx %u\n", (k >> 63) ? 'L' : 'P',
+                (unsigned)((k >> 56) & 0x7F), (unsigned long)(k & 0xFFFFFFFFFFFFFFull),
+                s_prof_hist[i].count);
+    }
+    for (uint32_t i = 0; i < PROF_STACK_SLOTS; ++i) {
+        const prof_stack *e = &s_prof_stacks[i];
+        if (!e->hash)
+            continue;
+        fprintf(f, "S %u %u", e->thread, e->count);
+        for (int k = 0; k < PROF_STACK_DEPTH && (k < 2 || e->frames[k]); ++k)
+            fprintf(f, " 0x%lx", (unsigned long)e->frames[k]);
+        fputc('\n', f);
+    }
+    fclose(f);
+    memset(s_prof_hist, 0, PROF_SLOTS * sizeof(prof_slot));
+    memset(s_prof_stacks, 0, PROF_STACK_SLOTS * sizeof(prof_stack));
+}
+
+static void prof_thread_main(void *arg)
+{
+    (void)arg;
+    uintptr_t base = (uintptr_t)__code_start;
+    uint64_t window_start = armGetSystemTick();
+    uint64_t samples = 0;
+    int window = 0;
+    while (!s_prof_stop) {
+        svcSleepThread(1000000ull);
+        int nt = s_prof_nthreads < PROF_MAX_THREADS ? s_prof_nthreads : PROF_MAX_THREADS;
+        for (int t = 0; t < nt; ++t) {
+            Handle h = __atomic_load_n(&s_prof_handles[t], __ATOMIC_ACQUIRE);
+            if (!h || R_FAILED(svcSetThreadActivity(h, ThreadActivity_Paused)))
+                continue;
+            ThreadContext ctx;
+            Result rc = svcGetThreadContext3(&ctx, h);
+            svcSetThreadActivity(h, ThreadActivity_Runnable);
+            if (R_FAILED(rc))
+                continue;
+            uint64_t tag = (uint64_t)t << 56;
+            prof_count(tag | ((ctx.pc.x - base) & 0xFFFFFFFFFFFFFFull));
+            prof_count((1ull << 63) | tag | ((ctx.lr - base) & 0xFFFFFFFFFFFFFFull));
+            prof_count_stack(t, &ctx, base);
+            samples++;
+        }
+        if (armTicksToNs(armGetSystemTick() - window_start) >= 5000000000ull) {
+            prof_dump(window++, samples);
+            samples = 0;
+            window_start = armGetSystemTick();
+        }
+    }
+}
+
+static void prof_start(void)
+{
+    if (!prof_enabled())
+        return;
+    s_prof_hist = calloc(PROF_SLOTS, sizeof(prof_slot));
+    s_prof_stacks = calloc(PROF_STACK_SLOTS, sizeof(prof_stack));
+    if (!s_prof_hist || !s_prof_stacks)
+        return;
+    mkdir("/switch/mspacman/prof", 0777);
+    prof_register_thread(envGetMainThreadHandle(), (void *)__wrap_main);
+    if (R_FAILED(threadCreate(&s_prof_thread, prof_thread_main, NULL, NULL,
+                              0x10000, 0x20, -2)))
+        return;
+    svcSetThreadCoreMask(s_prof_thread.handle, 1, 0x6);
+    if (R_SUCCEEDED(threadStart(&s_prof_thread)))
+        fprintf(stderr, "[switch] sampling profiler on -> /switch/mspacman/prof/\n");
+}
+
+static void prof_stop(void)
+{
+    if (!s_prof_hist)
+        return;
+    s_prof_stop = 1;
+    threadWaitForExit(&s_prof_thread);
+    threadClose(&s_prof_thread);
+}
+

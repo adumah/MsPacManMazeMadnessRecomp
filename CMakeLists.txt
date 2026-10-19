@@ -39,6 +39,24 @@ set(PSX_PRELOADED_MODS "${CMAKE_CURRENT_SOURCE_DIR}/mods/preloaded")
 if(NOT IS_DIRECTORY "${PSX_PRELOADED_MODS}")
     set(PSX_PRELOADED_MODS "NONE")
 endif()
+# The Switch defaults to the original 4:3 picture: in 16:9 the extra
+# bookkeeping costs ~12% of a frame, and full speed needs it. Stage a copy of
+# the catalog with the widescreen features off by default; mods/state.toml on
+# the SD card can still turn them on.
+if(NINTENDO_SWITCH AND NOT PSX_PRELOADED_MODS STREQUAL "NONE")
+    set(_mpmm_ws_manifest
+        "packages/mpmm.enhancement.widescreen/1.0.0/manifest.toml")
+    set(_mpmm_switch_mods "${CMAKE_CURRENT_BINARY_DIR}/mods-preloaded-switch")
+    file(REMOVE_RECURSE "${_mpmm_switch_mods}")
+    file(COPY "${PSX_PRELOADED_MODS}/" DESTINATION "${_mpmm_switch_mods}")
+    file(READ "${PSX_PRELOADED_MODS}/${_mpmm_ws_manifest}" _mpmm_ws)
+    string(REPLACE "default_enabled = true" "default_enabled = false"
+        _mpmm_ws "${_mpmm_ws}")
+    file(WRITE "${_mpmm_switch_mods}/${_mpmm_ws_manifest}" "${_mpmm_ws}")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${PSX_PRELOADED_MODS}/${_mpmm_ws_manifest}")
+    set(PSX_PRELOADED_MODS "${_mpmm_switch_mods}")
+endif()
 
 psxrecomp_add_game_runtime(psx-runtime
     PRELOADED_MODS_DIR "${PSX_PRELOADED_MODS}"

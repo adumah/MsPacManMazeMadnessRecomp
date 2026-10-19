@@ -1,3 +1,20 @@
+diff --git a/runtime/include/iso_reader.h b/runtime/include/iso_reader.h
+index 7737d494..e1d178a6 100644
+--- a/runtime/include/iso_reader.h
++++ b/runtime/include/iso_reader.h
+@@ -73,6 +73,12 @@ struct BinSegment {
+     uint32_t      start_lba;     // disc sector of this file's first stored sector
+     uint32_t      sector_count;  // sectors stored in this file
+     bool          raw;           // 2352-byte raw sectors (BIN) vs 2048 (ISO)
++    // Raw-sector read-ahead: ra_count sectors from file sector ra_first. A
++    // seek drops the stream buffer, so without it every sector is a separate
++    // host read (one IPC per sector on Switch, where FMV streaming showed it).
++    std::vector<uint8_t> ra_buf;
++    uint32_t      ra_first = 0;
++    uint32_t      ra_count = 0;
+ };
+ 
+ /**
 diff --git a/runtime/src/debug_server.c b/runtime/src/debug_server.c
 index 479eb518..0774c08a 100644
 --- a/runtime/src/debug_server.c
@@ -13,8 +30,239 @@ index 479eb518..0774c08a 100644
  #  include <sys/time.h>     /* struct timeval — socket send/recv timeouts */
  #  include <unistd.h>
  #  include <fcntl.h>
+diff --git a/runtime/src/dma.c b/runtime/src/dma.c
+index b60d8add..1210d567 100644
+--- a/runtime/src/dma.c
++++ b/runtime/src/dma.c
+@@ -1180,6 +1180,42 @@ uint32_t dma_cycles_to_irq(uint32_t i_mask) {
+     return best;
+ }
+ 
++/* DMA event window (PSX_DMA_EVENT_WINDOW, guest cycles; default 1 = every
++ * word is its own deadline, the faithful timeline). MDEC, CD-ROM and GPU
++ * linked-list DMA cost 1-14 cycles per word, so a transfer otherwise makes the
++ * scheduler service every device once per word: ~38K services per 320x240
++ * video frame, one per display-list word. A slow host (Switch A57) can't keep
++ * up. With a window of N, a busy channel's next deadline is stretched to at
++ * most N cycles (never past the end of its transfer) and the advance functions
++ * move every word due in that span in one call. Other devices' events still
++ * bound each step, and guest MMIO still catches DMA up exactly
++ * (psx_devices_mmio_sync); only plain-RAM polling of a destination buffer can
++ * see words land up to N cycles late. */
++static uint32_t dma_event_window(void) {
++    static uint32_t window = 0;
++    if (window == 0) {
++        const char *e = getenv("PSX_DMA_EVENT_WINDOW");
++        long v = e ? strtol(e, NULL, 10) : 1;
++        window = v > 1 ? (uint32_t)(v > 65536 ? 65536 : v) : 1u;
++        if (window > 1u)
++            fprintf(stderr, "psxrecomp: DMA event window %u cycles "
++                            "(PSX_DMA_EVENT_WINDOW)\n", window);
++    }
++    return window;
++}
++
++/* Stretch a channel's next deadline d to the window, capped at the cycles it
++ * needs to finish `words` more words at cpw cycles each (accum already paid). */
++static uint32_t dma_windowed(uint32_t d, uint32_t words, uint32_t cpw,
++                             uint32_t accum) {
++    uint32_t window = dma_event_window();
++    if (window <= d) return d;
++    uint64_t left = (uint64_t)words * cpw;
++    left = left > accum ? left - accum : 1u;
++    if (left < window) window = (uint32_t)left;
++    return window > d ? window : d;
++}
++
+ uint32_t dma_cycles_to_internal_event(void) {
+     uint32_t best = 0xFFFFFFFFu;
+ 
+@@ -1201,6 +1237,7 @@ uint32_t dma_cycles_to_internal_event(void) {
+         uint32_t cpw = ch == 0 ? DMA_MDEC_IN_CYCLES_PER_WORD
+                                : DMA_MDEC_OUT_CYCLES_PER_WORD;
+         uint32_t d = a->cycles_accum < cpw ? cpw - a->cycles_accum : 1u;
++        d = dma_windowed(d, a->remaining_words, cpw, a->cycles_accum);
+         if (d < best) best = d;
+     }
+ 
+@@ -1215,13 +1252,19 @@ uint32_t dma_cycles_to_internal_event(void) {
+             uint32_t d = cdrom_async.cycles_accum < DMA_CDROM_CYCLES_PER_WORD
+                        ? DMA_CDROM_CYCLES_PER_WORD - cdrom_async.cycles_accum
+                        : 1u;
++            d = dma_windowed(d, cdrom_async.remaining_words,
++                             DMA_CDROM_CYCLES_PER_WORD, cdrom_async.cycles_accum);
+             if (d < best) best = d;
+         }
+     }
+ 
+     if (gpu_linked_list.active && ((channels[2].chcr >> 24) & 1u) &&
+         channel_enabled(2)) {
++        /* The list's length isn't known ahead, so its end (and IRQ) can land
++         * up to one window late. */
+         uint32_t d = dma_gpu_ll_cycles_to_event(&gpu_linked_list);
++        uint32_t window = dma_event_window();
++        if (window > d) d = window;
+         if (d < best) best = d;
+     }
+ 
+diff --git a/runtime/src/frame_pacing.c b/runtime/src/frame_pacing.c
+index be30e5af..cb0f7d97 100644
+--- a/runtime/src/frame_pacing.c
++++ b/runtime/src/frame_pacing.c
+@@ -4,6 +4,8 @@
+  */
+ #include "frame_pacing.h"
+ 
++#include <stdlib.h>
++
+ /* FRAME_PACING_PURE_ONLY: tests compile only the SDL-free decision
+  * function (tests/test_frame_pacing.c includes this file directly). */
+ #ifndef FRAME_PACING_PURE_ONLY
+@@ -44,6 +46,15 @@ uint32_t frame_pacing_sleep_ms(uint64_t now, uint64_t deadline,
+ #define FRAME_PACER_CATCHUP_MAX_PERIODS 12u
+ 
+ void frame_pacer_wait(FramePacer *p, double period_ms) {
++    /* Throughput benchmarks (PSX_PERF_UNCAPPED=1, with PSX_VSYNC=0): no host
++     * pacing at all, so guest frames per wall second measure emulation cost.
++     * Guest cycle accounting is untouched. */
++    static int uncapped = -1;
++    if (uncapped < 0) {
++        const char *e = getenv("PSX_PERF_UNCAPPED");
++        uncapped = e && e[0] == '1';
++    }
++    if (uncapped) return;
+     uint64_t freq = SDL_GetPerformanceFrequency();
+     uint64_t period = (uint64_t)((double)freq * (period_ms / 1000.0));
+     uint64_t now = SDL_GetPerformanceCounter();
+diff --git a/runtime/src/gpu.c b/runtime/src/gpu.c
+index 17890e93..532b6750 100644
+--- a/runtime/src/gpu.c
++++ b/runtime/src/gpu.c
+@@ -6785,6 +6785,20 @@ static int ws_ui_prepass_order_cmp(const void *x, const void *y) {
+ 
+ /* The first prepass record of `resolved`, as the linear scan found it. */
+ static const WsUiPrepassNode *ws_ui_prepass_find_node(uint32_t resolved) {
++    /* The DMA walk visits the nodes in the order the prepass recorded them
++     * and asks for each one twice (header, then payload), so the record at or
++     * just after the last answer is almost always the one. A completed
++     * prepass holds each address once (a repeat would be a cycle, which runs
++     * into the node cap and discards the record), so a hit here is the same
++     * record the search below finds. Sorting the index each frame and two
++     * searches per node were ~5% of the Switch's emulation thread. */
++    static uint32_t hint;
++    for (uint32_t i = hint; i < hint + 2u && i < ws_ui_prepass_node_count; i++) {
++        if (ws_ui_prepass_nodes[i].addr == resolved) {
++            hint = i;
++            return &ws_ui_prepass_nodes[i];
++        }
++    }
+     if (ws_ui_prepass_order_gen != ws_ui_prepass_gen ||
+         ws_ui_prepass_order_count != ws_ui_prepass_node_count) {
+         for (uint32_t i = 0; i < ws_ui_prepass_node_count; i++)
+@@ -6801,8 +6815,10 @@ static const WsUiPrepassNode *ws_ui_prepass_find_node(uint32_t resolved) {
+         else hi = mid;
+     }
+     if (lo < ws_ui_prepass_order_count &&
+-        ws_ui_prepass_nodes[ws_ui_prepass_order[lo]].addr == resolved)
+-        return &ws_ui_prepass_nodes[ws_ui_prepass_order[lo]];
++        ws_ui_prepass_nodes[ws_ui_prepass_order[lo]].addr == resolved) {
++        hint = ws_ui_prepass_order[lo];
++        return &ws_ui_prepass_nodes[hint];
++    }
+     return NULL;
+ }
+ 
+diff --git a/runtime/src/interrupts.c b/runtime/src/interrupts.c
+index 9e2b00e4..135c2b13 100644
+--- a/runtime/src/interrupts.c
++++ b/runtime/src/interrupts.c
+@@ -2221,6 +2221,36 @@ irq_deliver_eval:
+  * here gives the mmx6 baseline interrupt behavior — sufficient to build+run the
+  * current generated code on the good baseline for instrumented comparison. */
+ void psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc) {
++#if !defined(PSX_COSIM)
++    /* Compiled-edge fast path: the same two no-delivery returns
++     * psx_check_interrupts takes first (sticky I_STAT with IEc/IM2 clear, and
++     * nothing pending), checked in the same order after the same batch flush,
++     * without entering that function's frame. Generated code calls this at
++     * every branch edge, and on a slow host (Switch A57) the full entry was
++     * ~10% of the emulation thread. Idle skip, netplay, exceptions, deferred
++     * thread switches and the periodic maintenance tick take the full path. */
++    extern int psx_netplay_active(void);
++    if (!g_psx_guest_time_frozen && !in_exception && !s_defer_switch_pending &&
++        g_idle_skip_enabled == 0 && ((s_fast_maintenance + 1u) & 0x3FFFu) != 0u &&
++        !psx_netplay_active()) {
++        psx_cyc_batch_flush();
++        const uint32_t sr = cpu->cop0[COP0_SR];
++        int no_delivery;
++        if ((i_stat & i_mask) != 0)
++            no_delivery = !(sr & 0x01u) || !(sr & (1u << 10));
++        else
++            no_delivery = (cpu->cop0[COP0_CAUSE] & sr & 0x0300u) == 0;
++        if (no_delivery) {
++            extern int g_ls_suppress_record;
++            s_irq_path_entry++;
++            if ((i_stat & i_mask) != 0) s_irq_path_fast_sr++;
++            else s_irq_path_fast_none++;
++            ++s_fast_maintenance;
++            if (g_ls_suppress_record > 0) g_ls_suppress_record--;
++            return;
++        }
++    }
++#endif
+     uint32_t prev = s_compiled_interrupt_resume_pc;
+     s_compiled_interrupt_resume_pc = resume_pc;
+     psx_check_interrupts(cpu); /* flushes load-charge batch on entry */
+diff --git a/runtime/src/iso_reader.cpp b/runtime/src/iso_reader.cpp
+index 5c6c5cfb..a703da85 100644
+--- a/runtime/src/iso_reader.cpp
++++ b/runtime/src/iso_reader.cpp
+@@ -684,6 +684,23 @@ bool ISOReader::ReadRawSector(uint32_t lba, uint8_t* buffer) {
+     }
+     const uint32_t local_lba = span->file_sector + (lba - span->disc_start);
+ 
++    if (local_lba - seg->ra_first < seg->ra_count) {
++        std::memcpy(buffer, seg->ra_buf.data() +
++                    (size_t)(local_lba - seg->ra_first) * RAW_SECTOR_SIZE,
++                    RAW_SECTOR_SIZE);
++        return true;
++    }
++
++    /* Disc data is immutable, so reading ahead changes only host cost. Reads
++     * are sequential while streaming; a seek elsewhere just refills. */
++    constexpr uint32_t kReadAheadSectors = 32;
++    uint32_t want = kReadAheadSectors;
++    if (local_lba < seg->sector_count && seg->sector_count - local_lba < want)
++        want = seg->sector_count - local_lba;
++    if (want == 0) want = 1;
++    seg->ra_buf.resize((size_t)kReadAheadSectors * RAW_SECTOR_SIZE);
++    seg->ra_count = 0;
++
+     seg->file.clear();
+     std::streampos offset = static_cast<std::streampos>(local_lba) * RAW_SECTOR_SIZE;
+     seg->file.seekg(offset, std::ios::beg);
+@@ -692,11 +709,16 @@ bool ISOReader::ReadRawSector(uint32_t lba, uint8_t* buffer) {
+         return false;
+     }
+ 
+-    seg->file.read(reinterpret_cast<char*>(buffer), RAW_SECTOR_SIZE);
++    seg->file.read(reinterpret_cast<char*>(seg->ra_buf.data()),
++                   (std::streamsize)want * RAW_SECTOR_SIZE);
+     std::streamsize bytes_read = seg->file.gcount();
+-    bool success = (bytes_read == RAW_SECTOR_SIZE);
+     seg->file.clear();
+-    return success;
++    if (bytes_read < (std::streamsize)RAW_SECTOR_SIZE)
++        return false;
++    seg->ra_first = local_lba;
++    seg->ra_count = (uint32_t)(bytes_read / RAW_SECTOR_SIZE);
++    std::memcpy(buffer, seg->ra_buf.data(), RAW_SECTOR_SIZE);
++    return true;
+ }
+ 
+ bool ISOReader::IsOpen() const {
 diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
-index 4a66663d..5fd07ed6 100644
+index 4a66663d..e67a43e9 100644
 --- a/runtime/src/main.cpp
 +++ b/runtime/src/main.cpp
 @@ -207,7 +207,9 @@ extern "C" void psx_game_codegen_forward_if_built(int argc, char** argv);
@@ -28,7 +276,44 @@ index 4a66663d..5fd07ed6 100644
  #include <netdb.h>
  #include <net/if.h>
  #include <netinet/in.h>
-@@ -14838,6 +14840,9 @@ namespace {
+@@ -4699,6 +4701,12 @@ static void frame_report_tick(uint64_t frames) {
+     last_real = real;
+ }
+ 
++#ifdef PSX_HAS_OVERLAY_DISPATCH
++extern "C" void psx_overlay_static_get_stats(uint64_t *, uint64_t *,
++                                             uint64_t *, uint64_t *);
++extern "C" uint32_t g_overlay_code_epoch;
++#endif
++
+ static void runtime_perf_diag_tick() {
+     static bool have_last = false;
+     static RuntimePerfSnapshot last;
+@@ -4786,6 +4794,23 @@ static void runtime_perf_diag_tick() {
+         current.capture_triggers - last.capture_triggers,
+         current.capture_overlays - last.capture_overlays,
+         (unsigned long long)current.capture_last_dispatch_delta);
++#ifdef PSX_HAS_OVERLAY_DISPATCH
++    {
++        /* Static overlay dispatch rate and how often watched code pages
++         * change (each change invalidates the dispatcher's memo). */
++        static uint64_t last_hits = 0, last_checks = 0;
++        static uint32_t last_epoch = 0;
++        uint64_t checks = 0, hits = 0;
++        psx_overlay_static_get_stats(&checks, &hits, nullptr, nullptr);
++        std::fprintf(stdout,
++            "psxrecomp: overlay static dispatch=%.0f/s checks=%.0f/s code_epoch=+%u\n",
++            (double)(hits - last_hits) / dt, (double)(checks - last_checks) / dt,
++            g_overlay_code_epoch - last_epoch);
++        last_hits = hits;
++        last_checks = checks;
++        last_epoch = g_overlay_code_epoch;
++    }
++#endif
+     std::fflush(stdout);
+     last = current;
+     last_spu = audio.tap_frames[AUDIO_TAP_SPU_OUT];
+@@ -14838,6 +14863,9 @@ namespace {
                  push(ip, label);
              }
          }
@@ -38,6 +323,47 @@ index 4a66663d..5fd07ed6 100644
  #else
          struct ifaddrs* ifa = nullptr;
          if (getifaddrs(&ifa) != 0 || !ifa) return;
+diff --git a/runtime/src/memory.c b/runtime/src/memory.c
+index f994d3cc..1692df73 100644
+--- a/runtime/src/memory.c
++++ b/runtime/src/memory.c
+@@ -866,6 +866,12 @@ void dirty_ram_set_bitmap_words(const uint32_t* words, uint32_t count) {
+ static uint32_t overlay_watch_bitmap[DIRTY_RAM_BITMAP_WORDS];
+ static uint32_t overlay_page_gen[DIRTY_RAM_PAGE_COUNT];
+ 
++/* Advances whenever any overlay_page_gen entry changes (or all are reset).
++ * Unchanged epoch = no watched page changed, so a validation result taken at
++ * that epoch still holds: the static dispatcher memoizes on it (generated
++ * psx_overlay_static_find_variant) to skip the per-range gen_sum walk. */
++uint32_t g_overlay_code_epoch = 1;
++
+ void dirty_ram_reset_for_boot(void) {
+     memset(dirty_ram_bitmap, 0, sizeof(dirty_ram_bitmap));
+     memset(text_modified_bitmap, 0, sizeof(text_modified_bitmap));
+@@ -873,6 +879,7 @@ void dirty_ram_reset_for_boot(void) {
+     g_text_diverged_pages = 0;
+     memset(overlay_watch_bitmap, 0, sizeof(overlay_watch_bitmap));
+     memset(overlay_page_gen, 0, sizeof(overlay_page_gen));
++    g_overlay_code_epoch++;
+     memset(g_dirty_ram_exec_page_bitmap, 0, sizeof(g_dirty_ram_exec_page_bitmap));
+     memset(g_dirty_ram_exec_pc_bitmap, 0, sizeof(g_dirty_ram_exec_pc_bitmap));
+     dirty_ram_dispatch_evidence_clear(0u, DIRTY_RAM_EXEC_BITMAP_WORDS);
+@@ -958,6 +965,7 @@ void dirty_ram_text_guard_resync_after_restore(void) {
+ void overlay_watch_invalidate_after_ram_restore(void) {
+     for (uint32_t pg = 0; pg < DIRTY_RAM_PAGE_COUNT; pg++)
+         overlay_page_gen[pg]++;
++    g_overlay_code_epoch++;
+     extern void overlay_loader_note_code_write(void);
+     extern void overlay_loader_resync_validation_after_restore(void);
+     overlay_loader_note_code_write();
+@@ -983,6 +991,7 @@ static inline void overlay_watch_note_write(uint32_t phys, uint32_t size) {
+     }
+     if ((overlay_watch_bitmap[pg >> 5] >> (pg & 31u)) & 1u) {
+         overlay_page_gen[pg]++;
++        g_overlay_code_epoch++;
+         /* Also invalidate generation-aware negative overlay lookups: bytes in
+          * a manifested code page may now match a previously absent variant.
+          * Keep this separate from g_dirty_ram_code_gen: interpreter widescreen
 diff --git a/runtime/src/overlay_posix.c b/runtime/src/overlay_posix.c
 index 5d59197f..1ee3999e 100644
 --- a/runtime/src/overlay_posix.c
@@ -192,3 +518,65 @@ index a379eca0..dcd1e4e5 100644
  #else /* POSIX: ucontext */
  
  #ifndef _XOPEN_SOURCE
+diff --git a/tools/compile_overlays.py b/tools/compile_overlays.py
+index 5d47ec7d..f522dc64 100644
+--- a/tools/compile_overlays.py
++++ b/tools/compile_overlays.py
+@@ -3053,6 +3053,23 @@ def generate_overlay_dispatch(variants: list) -> str:
+         '/* Entry index of the last successful find (single-threaded dispatch). */',
+         'static uint32_t psx_ov_found_entry = 0;',
+         '',
++        '/* Find memo: the variant each recent address resolved to, valid while',
++        ' * g_overlay_code_epoch (memory.c) is unchanged, i.e. while no watched',
++        ' * code page was written. A validated variant\'s pages are watched (the',
++        ' * gate arms them), so at an unchanged epoch the gate would accept it',
++        ' * again and the walk would return it first (it is the memo occupant).',
++        ' * The probe, entry and variant tables span megabytes; a hit here is one',
++        ' * small-table load instead of a chain of cache misses. */',
++        '#define PSX_OV_FIND_MEMO_SIZE 4096u',
++        'typedef struct {',
++        '    uint32_t addr;',
++        '    uint32_t epoch;',
++        '    uint32_t entry;',
++        '    const PsxOvVariant *v;',
++        '} PsxOvFindMemo;',
++        'static PsxOvFindMemo psx_ov_find_memo[PSX_OV_FIND_MEMO_SIZE];',
++        'extern uint32_t g_overlay_code_epoch;',
++        '',
+         'static const PsxOvVariant *psx_overlay_static_find_variant(uint32_t addr) {',
+     ] + segment_gate + [
+         '        psx_ov_static_address_misses++;',
+@@ -3091,6 +3108,11 @@ def generate_overlay_dispatch(variants: list) -> str:
+         return '\n'.join(lines)
+ 
+     lines += [
++        '    PsxOvFindMemo *fm = &psx_ov_find_memo[(key >> 2) & (PSX_OV_FIND_MEMO_SIZE - 1u)];',
++        '    if (fm->addr == key && fm->epoch == g_overlay_code_epoch) {',
++        '        psx_ov_found_entry = fm->entry;',
++        '        return fm->v;',
++        '    }',
+         '    uint32_t slot = psx_ov_hash_slot(key);',
+         '    for (;;) {',
+         '        uint32_t slot_addr = psx_ov_hash_addr[slot];',
+@@ -3121,6 +3143,10 @@ def generate_overlay_dispatch(variants: list) -> str:
+         '            if (psx_overlay_static_code_matches(v->ranges, v->count,',
+         '                                               v->crc)) {',
+         '                psx_ov_found_entry = ei;',
++        '                fm->addr = key;',
++        '                fm->epoch = g_overlay_code_epoch;',
++        '                fm->entry = ei;',
++        '                fm->v = v;',
+         '                return v;',
+         '            }',
+         '            psx_ov_static_variant_misses++;',
+@@ -3133,6 +3159,10 @@ def generate_overlay_dispatch(variants: list) -> str:
+         '                                               v->crc)) {',
+         '                psx_ov_last_hit[ei] = (uint16_t)i;',
+         '                psx_ov_found_entry = ei;',
++        '                fm->addr = key;',
++        '                fm->epoch = g_overlay_code_epoch;',
++        '                fm->entry = ei;',
++        '                fm->v = v;',
+         '                return v;',
+         '            }',
+         '            psx_ov_static_variant_misses++;',
