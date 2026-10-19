@@ -45,11 +45,16 @@ and troubleshooting, is **[BUILD.md](BUILD.md)**. In short:
    and `cmake --build build-release --target psx-runtime -j2`
 7. Play: `./launch-mspacman.sh`
 
+**Nintendo Switch:** a homebrew build for consoles running Atmosphère, built
+the same way from your own copy, runs at full speed in 4:3. See
+**[BUILD-SWITCH.md](BUILD-SWITCH.md)**.
+
 ## Repository layout
 
 | Path | Purpose |
 |---|---|
 | `BUILD.md` | Step-by-step build from your disc |
+| `BUILD-SWITCH.md`, `switch/`, `patches/`, `tools/package_switch.sh` | Nintendo Switch build |
 | `game.toml` | Game, disc, runtime, widescreen and controller configuration |
 | `aot/overlays.json` | Which disc programs are compiled natively, and how |
 | `mods/` | Widescreen mod (16:9, round billboards) |

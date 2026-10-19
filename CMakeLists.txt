@@ -27,6 +27,10 @@ set(PSX_RECOMP_UI OFF CACHE BOOL
 # Horizon has no dynamic loader (no libdl); overlays are linked statically.
 if(NINTENDO_SWITCH)
     set(CMAKE_DL_LIBS "")
+    # devkitPro's Switch.cmake makes Release "-g -O2". Full speed on the
+    # console was measured with -O3, as on the other platforms.
+    set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG")
+    set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
 endif()
 include("${PSXRECOMP_ROOT}/runtime/runtime.cmake")
 
