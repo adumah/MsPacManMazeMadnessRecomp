@@ -32,6 +32,9 @@ about 53 fps. Tested on hardware with Atmosphère.
   (On Arch-based systems with the devkitPro repositories added to pacman, use
   `sudo pacman -S` with the same package names.) Tested with devkitA64 r30
   (GCC 16.1), libnx 4.12.0, switch-sdl2 2.28.5 and switch-mesa 20.1.0.
+- **Pillow** for Python (`python-pillow` on Arch, `python3-pil` on
+  Debian/Ubuntu, or `python3 -m pip install pillow`), to make the Homebrew
+  Menu icon from your disc. Without it the build uses the default icon.
 - **A Switch with Atmosphère** and the Homebrew Menu, and a way to copy files
   to its SD card.
 
@@ -95,6 +98,12 @@ systemd-run --user --scope -p MemoryMax=10G -p MemorySwapMax=4G \
 ```
 
 The result is `build-switch/mspacman.nro`.
+
+Its Homebrew Menu icon is Ms. Pac-Man from the arcade cabinet art that
+classic mode shows beside the maze, cut from your disc when CMake configures
+(`tools/make_switch_icon.py`; CMake prints `Switch icon: ...`). To use your
+own picture instead, put a 256x256 JPEG at `switch/icon.jpg` and configure
+again; that file is ignored by git.
 
 ## 7. Put it on the SD card
 

@@ -104,9 +104,35 @@ if(NINTENDO_SWITCH)
         NAME "Ms. Pac-Man Maze Madness Recompiled"
         AUTHOR "adumah"
         VERSION "${_MPMM_VERSION}")
+    # Homebrew Menu icon: switch/icon.jpg if you add one (256x256 JPEG, never
+    # committed); otherwise Ms. Pac-Man from the classic-mode cabinet art on
+    # your disc (tools/make_switch_icon.py, needs Pillow); otherwise libnx's
+    # default icon.
+    set(_mpmm_icon "${CMAKE_CURRENT_SOURCE_DIR}/switch/icon.jpg")
+    if(NOT EXISTS "${_mpmm_icon}")
+        set(_mpmm_icon "${CMAKE_CURRENT_BINARY_DIR}/icon-from-disc.jpg")
+        set(_mpmm_cue "${CMAKE_CURRENT_SOURCE_DIR}/disc/Ms. Pac-Man - Maze Madness.cue")
+        find_program(MPMM_PYTHON3 python3 REQUIRED)
+        file(REMOVE "${_mpmm_icon}")
+        if(EXISTS "${_mpmm_cue}")
+            execute_process(
+                COMMAND "${MPMM_PYTHON3}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/make_switch_icon.py"
+                    --cue "${_mpmm_cue}" --out "${_mpmm_icon}"
+                OUTPUT_QUIET)
+        endif()
+    endif()
+    if(EXISTS "${_mpmm_icon}")
+        message(STATUS "Switch icon: ${_mpmm_icon}")
+        set(_mpmm_icon_args ICON "${_mpmm_icon}")
+    else()
+        message(STATUS "Switch icon: libnx default")
+        set(_mpmm_icon_args "")
+    endif()
     nx_create_nro(psx-runtime
         OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/mspacman.nro"
-        NACP mspacman.nacp)
+        NACP mspacman.nacp
+        ${_mpmm_icon_args})
 endif()
 
 # Stage runtime configs next to the exe for direct build/ launches. Only copy

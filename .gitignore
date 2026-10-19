@@ -92,3 +92,6 @@ starvation_dump.jsonl
 !/disc_probe.*.json
 !/disc_set.json
 !/.recomp.json
+
+# Optional Switch icon override (BUILD-SWITCH.md): your own picture, never committed.
+/switch/icon.jpg
