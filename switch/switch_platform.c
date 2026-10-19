@@ -247,7 +247,12 @@ int timespec_get(struct timespec *ts, int base)
  * priority on one core. A busy or spin-waiting main thread then starves the
  * runtime's other threads (overlay init, render, CD, audio) and startup hangs.
  * Let each new thread run on any of the application's cores 0-2, starting on
- * 1, 2, 0, ... in turn; the main thread keeps core 0. */
+ * 1, 2, 0, ... in turn; the main thread keeps core 0.
+ * libnx also gives threads a 128 KiB stack where glibc gives 8 MiB, and the
+ * runtime's threads overflowed it (classic mode crashed with SP below the
+ * stack region), so threads without their own stack get 8 MiB. */
+#define SWITCH_THREAD_STACK (8u << 20)
+
 typedef struct {
     void *(*start)(void *);
     void *arg;
@@ -275,7 +280,16 @@ int __wrap_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
     t->start = start;
     t->arg = arg;
     t->core = __atomic_fetch_add(&next_core, 1, __ATOMIC_RELAXED) % 3;
-    int rc = __real_pthread_create(thread, attr, thread_on_core, t);
+    pthread_attr_t big;
+    if (attr)
+        big = *attr;
+    else
+        pthread_attr_init(&big);
+    size_t size = 0;
+    pthread_attr_getstacksize(&big, &size);
+    if (!big.stackaddr && size < SWITCH_THREAD_STACK)
+        pthread_attr_setstacksize(&big, SWITCH_THREAD_STACK);
+    int rc = __real_pthread_create(thread, &big, thread_on_core, t);
     if (rc != 0)
         free(t);
     return rc;
