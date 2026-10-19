@@ -24,6 +24,10 @@ set(PSX_RECOMP_UI OFF CACHE BOOL
 # endif()
 # First-run setup wizard — enable after testing:
 # set(PSX_SETUP_WIZARD ON CACHE BOOL "…" FORCE)
+# Horizon has no dynamic loader (no libdl); overlays are linked statically.
+if(NINTENDO_SWITCH)
+    set(CMAKE_DL_LIBS "")
+endif()
 include("${PSXRECOMP_ROOT}/runtime/runtime.cmake")
 
 # This project's own mod catalog. The FRAMEWORK stages it -- together with its
@@ -60,6 +64,28 @@ psxrecomp_add_game_runtime(psx-runtime
 # Game-owned trusted mod plugins (selected by mods/preloaded/packages manifests).
 target_sources(psx-runtime PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/mods/src/mpmm_widescreen.c")
+
+# Nintendo Switch (devkitPro's Switch.cmake toolchain): Horizon platform layer
+# and the .nro. See switch/switch_platform.c for what the wraps are for.
+if(NINTENDO_SWITCH)
+    target_sources(psx-runtime PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/switch/switch_platform.c"
+        "${CMAKE_CURRENT_SOURCE_DIR}/switch/switch_terminate.cpp")
+    target_link_options(psx-runtime PRIVATE
+        "-Wl,--wrap=main" "-Wl,--wrap=rename" "-Wl,--wrap=getcwd"
+        "-Wl,--wrap=pthread_create" "-Wl,--wrap=abort")
+    # Direct GL calls resolve through libGLESv2's exports (Mesa dispatch).
+    target_link_libraries(psx-runtime PRIVATE GLESv2 glapi drm_nouveau nx)
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" _MPMM_VERSION)
+    string(STRIP "${_MPMM_VERSION}" _MPMM_VERSION)
+    nx_generate_nacp(OUTPUT mspacman.nacp
+        NAME "Ms. Pac-Man Maze Madness Recompiled"
+        AUTHOR "adumah"
+        VERSION "${_MPMM_VERSION}")
+    nx_create_nro(psx-runtime
+        OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/mspacman.nro"
+        NACP mspacman.nacp)
+endif()
 
 # Stage runtime configs next to the exe for direct build/ launches. Only copy
 # files that exist — never fail POST_BUILD when game_options.toml is absent.

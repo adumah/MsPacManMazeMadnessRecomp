@@ -1,0 +1,194 @@
+diff --git a/runtime/src/debug_server.c b/runtime/src/debug_server.c
+index 479eb518..0774c08a 100644
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -101,6 +101,10 @@
+ #else
+ #  include <sys/socket.h>
+ #  include <netinet/in.h>
++#  include <arpa/inet.h>    /* htonl/htons: not via netinet/in.h on newlib (Switch) */
++#  ifndef INADDR_LOOPBACK
++#    define INADDR_LOOPBACK 0x7f000001u
++#  endif
+ #  include <sys/time.h>     /* struct timeval — socket send/recv timeouts */
+ #  include <unistd.h>
+ #  include <fcntl.h>
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 4a66663d..5fd07ed6 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -207,7 +207,9 @@ extern "C" void psx_game_codegen_forward_if_built(int argc, char** argv);
+ #else
+ #include <arpa/inet.h>
+ #include <fcntl.h>
+-#include <ifaddrs.h>
++#ifndef __SWITCH__
++#include <ifaddrs.h>   /* no getifaddrs on Horizon (Switch) */
++#endif
+ #include <netdb.h>
+ #include <net/if.h>
+ #include <netinet/in.h>
+@@ -14838,6 +14840,9 @@ namespace {
+                 push(ip, label);
+             }
+         }
++#elif defined(__SWITCH__)
++        /* Horizon has no getifaddrs: no LAN addresses to list. */
++        (void)push;
+ #else
+         struct ifaddrs* ifa = nullptr;
+         if (getifaddrs(&ifa) != 0 || !ifa) return;
+diff --git a/runtime/src/overlay_posix.c b/runtime/src/overlay_posix.c
+index 5d59197f..1ee3999e 100644
+--- a/runtime/src/overlay_posix.c
++++ b/runtime/src/overlay_posix.c
+@@ -47,7 +47,9 @@ int psx_overlay_cache_name_parse(const char *name, uint32_t *region_start,
+     return 1;
+ }
+ 
+-#ifndef _WIN32
++/* Horizon (Switch) has no dlopen: overlays are linked statically there, so it
++ * shares the no-cache stubs below. */
++#if !defined(_WIN32) && !defined(__SWITCH__)
+ 
+ #include <dirent.h>
+ #include <dlfcn.h>
+diff --git a/runtime/src/psx_fiber.c b/runtime/src/psx_fiber.c
+index a379eca0..dcd1e4e5 100644
+--- a/runtime/src/psx_fiber.c
++++ b/runtime/src/psx_fiber.c
+@@ -1,5 +1,5 @@
+ /*
+- * psx_fiber.c — Win32-Fiber / POSIX-ucontext backends for psx_fiber.h.
++ * psx_fiber.c — Win32-Fiber / Switch-AArch64 / POSIX-ucontext backends for psx_fiber.h.
+  */
+ #include "psx_fiber.h"
+ 
+@@ -34,6 +34,127 @@ psx_fiber_t psx_fiber_create(size_t stack_size, psx_fiber_entry entry, void* arg
+ void psx_fiber_switch(psx_fiber_t target) { SwitchToFiber((LPVOID)target); }
+ void psx_fiber_destroy(psx_fiber_t fiber) { if (fiber) DeleteFiber((LPVOID)fiber); }
+ 
++#elif defined(__SWITCH__)
++/* Horizon (libnx + newlib) has no ucontext. A minimal AArch64 context
++ * switch: save the AAPCS64 callee-saved state (x19-x28, fp, lr, sp, d8-d15)
++ * of the running fiber and load the target's. Cooperative and
++ * single-threaded, like the ucontext backend. */
++#include <stdlib.h>
++#include <stdint.h>
++
++enum { PSX_FIBER_REGS = 21 };   /* x19..x30 (12), sp (1), d8..d15 (8) */
++
++typedef struct psx_fiber_impl {
++    uint64_t        regs[PSX_FIBER_REGS];
++    void*           stack;    /* NULL for the thread-fiber */
++    psx_fiber_entry entry;
++    void*           arg;
++} psx_fiber_impl;
++
++void psx_fiber_swap_a64(uint64_t* save, const uint64_t* load);
++void psx_fiber_start_a64(void);
++
++__asm__(
++    ".text\n"
++    ".balign 16\n"
++    ".global psx_fiber_swap_a64\n"
++    ".type psx_fiber_swap_a64, %function\n"
++    "psx_fiber_swap_a64:\n"
++    "    stp x19, x20, [x0, #0]\n"
++    "    stp x21, x22, [x0, #16]\n"
++    "    stp x23, x24, [x0, #32]\n"
++    "    stp x25, x26, [x0, #48]\n"
++    "    stp x27, x28, [x0, #64]\n"
++    "    stp x29, x30, [x0, #80]\n"
++    "    mov x9, sp\n"
++    "    str x9, [x0, #96]\n"
++    "    stp d8, d9, [x0, #104]\n"
++    "    stp d10, d11, [x0, #120]\n"
++    "    stp d12, d13, [x0, #136]\n"
++    "    stp d14, d15, [x0, #152]\n"
++    "    ldp x19, x20, [x1, #0]\n"
++    "    ldp x21, x22, [x1, #16]\n"
++    "    ldp x23, x24, [x1, #32]\n"
++    "    ldp x25, x26, [x1, #48]\n"
++    "    ldp x27, x28, [x1, #64]\n"
++    "    ldp x29, x30, [x1, #80]\n"
++    "    ldr x9, [x1, #96]\n"
++    "    mov sp, x9\n"
++    "    ldp d8, d9, [x1, #104]\n"
++    "    ldp d10, d11, [x1, #120]\n"
++    "    ldp d12, d13, [x1, #136]\n"
++    "    ldp d14, d15, [x1, #152]\n"
++    "    ret\n"
++    ".size psx_fiber_swap_a64, .-psx_fiber_swap_a64\n"
++    /* First entry of a new fiber: psx_fiber_create puts the fiber pointer in
++     * x19 and this stub in lr, so the first swap "returns" here. */
++    ".balign 16\n"
++    ".global psx_fiber_start_a64\n"
++    ".type psx_fiber_start_a64, %function\n"
++    "psx_fiber_start_a64:\n"
++    "    mov x0, x19\n"
++    "    bl psx_fiber_run_a64\n"
++    "    brk #0\n"
++    ".size psx_fiber_start_a64, .-psx_fiber_start_a64\n");
++
++/* Cooperative + single-threaded, so a plain static tracks who's running. */
++static psx_fiber_impl* s_current = NULL;
++
++void psx_fiber_run_a64(psx_fiber_impl* f)
++{
++    f->entry(f->arg);
++    /* The BIOS thread entry never returns normally (it switches back to its
++     * scheduler target, or trap_crashes). Reaching here is a bug. */
++    abort();
++}
++
++psx_fiber_t psx_fiber_convert_thread(void)
++{
++    if (!s_current) {
++        psx_fiber_impl* f = (psx_fiber_impl*)calloc(1, sizeof(*f));
++        f->stack = NULL;       /* runs on the real thread stack */
++        s_current = f;
++    }
++    return (psx_fiber_t)s_current;
++}
++
++psx_fiber_t psx_fiber_current(void) { return (psx_fiber_t)s_current; }
++
++psx_fiber_t psx_fiber_create(size_t stack_size, psx_fiber_entry entry, void* arg)
++{
++    if (stack_size < 64u * 1024u) stack_size = 64u * 1024u;
++    psx_fiber_impl* f = (psx_fiber_impl*)calloc(1, sizeof(*f));
++    if (!f) return NULL;
++    f->stack = malloc(stack_size);
++    if (!f->stack) { free(f); return NULL; }
++    f->entry = entry;
++    f->arg   = arg;
++    uintptr_t top = ((uintptr_t)f->stack + stack_size) & ~(uintptr_t)15u;
++    f->regs[0]  = (uint64_t)(uintptr_t)f;                    /* x19 */
++    f->regs[10] = 0;                                         /* x29 */
++    f->regs[11] = (uint64_t)(uintptr_t)psx_fiber_start_a64;  /* x30 */
++    f->regs[12] = (uint64_t)top;                             /* sp  */
++    return (psx_fiber_t)f;
++}
++
++void psx_fiber_switch(psx_fiber_t target)
++{
++    psx_fiber_impl* to   = (psx_fiber_impl*)target;
++    psx_fiber_impl* from = s_current;
++    if (!to || to == from) return;
++    s_current = to;
++    psx_fiber_swap_a64(from->regs, to->regs);
++    /* Resumed: s_current was set back to `from` by whoever switched here. */
++}
++
++void psx_fiber_destroy(psx_fiber_t fiber)
++{
++    psx_fiber_impl* f = (psx_fiber_impl*)fiber;
++    if (!f) return;
++    free(f->stack);
++    free(f);
++}
++
+ #else /* POSIX: ucontext */
+ 
+ #ifndef _XOPEN_SOURCE
