@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="Ms. Pac-Man Maze Madness Recomp" width="600">
+</p>
+
 # Ms. Pac-Man Maze Madness — native Linux build
 
 A native Linux build of *Ms. Pac-Man Maze Madness* (PlayStation, USA,
