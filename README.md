@@ -2,10 +2,10 @@
   <img src="assets/logo.png" alt="Ms. Pac-Man Maze Madness Recomp" width="600">
 </p>
 
-# Ms. Pac-Man Maze Madness — native Linux build
+# Ms. Pac-Man Maze Madness — native Linux and Nintendo Switch builds
 
-A native Linux build of *Ms. Pac-Man Maze Madness* (PlayStation, USA,
-`SLUS-01018`) through static recompilation with
+Native Linux and Nintendo Switch builds of *Ms. Pac-Man Maze Madness*
+(PlayStation, USA, `SLUS-01018`) through static recompilation with
 [PSXRecomp](https://github.com/mstan/psxrecomp).
 
 This repository holds the **setup only**: configuration, a widescreen mod and
