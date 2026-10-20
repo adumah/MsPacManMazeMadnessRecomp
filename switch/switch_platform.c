@@ -103,10 +103,21 @@ static Result boost_set(u32 hz)
 static void *boost_thread_main(void *arg)
 {
     (void)arg;
+    int raises = 0, warned = 0;
     while (!s_boost_stop) {
         u32 hz = 0;
-        if (R_SUCCEEDED(boost_get(&hz)) && hz < s_boost_hz)
+        if (R_SUCCEEDED(boost_get(&hz)) && hz < s_boost_hz) {
             boost_set(s_boost_hz);
+            /* Docking or HOME resets the clock now and then; a tool that
+             * keeps lowering it is fighting the boost. */
+            if (++raises == 5 && !warned) {
+                warned = 1;
+                fprintf(stderr, "[switch] the CPU clock keeps dropping to %u MHz: "
+                                "an overclocking tool (sys-clk?) is setting a lower "
+                                "speed for this title; remove that setting\n",
+                        hz / 1000000u);
+            }
+        }
         for (int i = 0; i < 10 && !s_boost_stop; ++i)
             svcSleepThread(100000000ull);
     }
@@ -219,7 +230,12 @@ int __wrap_main(int argc, char **argv)
         snprintf(log_path, sizeof(log_path), "%s/log.txt", dir);
         snprintf(prev_path, sizeof(prev_path), "%s/log-previous.txt", dir);
         rename(log_path, prev_path);
-        if (freopen(log_path, "w", stdout))
+        /* Both streams append: newlib seeks to the end before each write only
+         * in "a" mode, so a "w" stdout would overwrite stderr's lines. */
+        FILE *log_new = fopen(log_path, "w");
+        if (log_new)
+            fclose(log_new);
+        if (freopen(log_path, "a", stdout))
             setvbuf(stdout, NULL, _IOLBF, 0);
         if (freopen(log_path, "a", stderr))
             setvbuf(stderr, NULL, _IOLBF, 0);
